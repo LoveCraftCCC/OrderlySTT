@@ -52,7 +52,6 @@ class BackendState:
             "raw_text": core.state.get("raw_text") or "",
             "last_error": core.state.get("last_error") or "",
             "audio_mode": core.state.get("audio_mode") or "共享",
-            "mic_guarded": bool(core.state.get("mic_guarded")),
             "exclusive": bool(core.config.get("exclusive_device", True)),
             "floating_bubble": bool(core.config.get("floating_bubble", False)),
             "input_device_index": core.config.get("input_device_index"),

@@ -163,7 +163,6 @@ const fallbackState: BackendState = {
   raw_text: "",
   last_error: "",
   audio_mode: "共享",
-  mic_guarded: false,
   exclusive: true,
   floating_bubble: false,
   input_device_index: null,
@@ -600,7 +599,7 @@ function App() {
             <ShieldCheck size={18} />
             <div>
               <strong>{state.exclusive ? "独占优先" : "共享模式"}</strong>
-              <span>{state.mic_guarded ? "默认麦克风已隔离" : state.audio_mode}</span>
+              <span>{state.audio_mode}</span>
             </div>
           </div>
           <div className="mini glass">
@@ -655,8 +654,8 @@ function App() {
 
             <label className="toggle-row">
               <span>
-                <strong>录音时独占设备</strong>
-                <em>优先阻止会议软件旁听</em>
+                <strong>优先使用独占录音</strong>
+                <em>尝试独占打开当前麦克风，不切换系统默认输入设备</em>
               </span>
               <input
                 type="checkbox"

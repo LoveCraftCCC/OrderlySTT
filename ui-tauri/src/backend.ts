@@ -11,7 +11,6 @@ export type BackendState = {
   raw_text: string;
   last_error: string;
   audio_mode: string;
-  mic_guarded: boolean;
   exclusive: boolean;
   floating_bubble: boolean;
   input_device_index: number | null;

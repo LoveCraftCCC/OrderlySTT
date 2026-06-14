@@ -143,9 +143,8 @@ def try_open_exclusive_stream(pa_instance, callback, sample_rate, channels, chun
 
 
 # ═══════════════════════════════════════════════════════════
-#  录音时切换默认麦克风 — 纯 ctypes COM, 不依赖 comtypes
-#  原理: CoCreateInstance + vtable 直接调用
-#  IPolicyConfig::SetDefaultEndpoint (SoundSwitch/EarTrumpet 同款方案)
+#  Windows 输入设备枚举 — 纯 ctypes COM, 不依赖 comtypes
+#  用于读取正确的 UTF-16 设备名和默认输入设备标记。
 # ═══════════════════════════════════════════════════════════
 from ctypes import (c_int, c_uint, c_ulong, c_ushort, c_void_p, c_wchar_p, wintypes,
                     POINTER, pointer, byref, cast, Structure, sizeof,
@@ -170,14 +169,9 @@ def _guid(s):
     return g
 
 CLSID_MMDeviceEnumerator    = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
-CLSID_PolicyConfig          = "{870AF99C-171D-4F9E-AF0D-E63DF40C2BC9}"
 IID_IMMDeviceEnumerator     = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
 IID_IMMDevice               = "{D666063F-1587-4E43-81F1-B948E807363F}"
 IID_IPropertyStore          = "{886d8eeb-8cf2-4446-8d02-cdba1dbdcf99}"
-# IPolicyConfig 的三个 IID 变体 (依次尝试)
-IID_PolicyConfig10  = "{824A9E1A-FE9E-47A3-AD79-309400D00B37}"  # Win10
-IID_PolicyConfig    = "{F8679F50-850A-41CF-9C72-430F290290C8}"  # Win10+
-IID_PolicyConfigV   = "{568B9108-44BF-40B4-9006-86AFE1B5E620}"  # Win8-
 
 CLSCTX_INPROC = 1
 STGM_READ = 0
@@ -265,7 +259,7 @@ def _enum_capture_devices_com():
     """
     devices = []
     default_id = None
-    # COM 必须在 STA 或 MTA 线程初始化. MicGuard 调用方可能已 init, 这里也 init
+    # COM 必须在 STA 或 MTA 线程初始化。调用方可能已 init，这里也 init
     # 一次保证独立工作.
     co_init = ole32.CoInitialize(None)
     try:
@@ -318,115 +312,6 @@ def _enum_capture_devices_com():
         log(f"_enum_capture_devices_com 异常: {e}\n{traceback.format_exc()}")
     return devices
 
-# MicGuard 全局状态: 记录"当前活跃的原始设备 ID", 防止 tray_exit 等硬退出路径漏恢复
-_mic_guard_state = {"orig_id": None}
-
-def _policy_set_default(device_id):
-    """模块级: IPolicyConfig::SetDefaultEndpoint — 把指定设备设为默认 (按 role 切三类)"""
-    for iid_name, iid in [("10", IID_PolicyConfig10), ("def", IID_PolicyConfig), ("v", IID_PolicyConfigV)]:
-        pc = c_void_p()
-        hr = ole32.CoCreateInstance(
-            byref(_guid(CLSID_PolicyConfig)), c_void_p(), c_ulong(CLSCTX_INPROC),
-            byref(_guid(iid)), byref(pc))
-        if hr >= 0 and pc.value:
-            call = _com_vtbl_call(pc, 13, ctypes.c_long, c_wchar_p, c_int)
-            for role, rname in [(0, "mult"), (1, "multi"), (2, "comm")]:
-                hr2 = call(pc, device_id, role)
-                log(f"PolicySetDefault [{iid_name}:{rname}] hr=0x{hr2:X}")
-            return
-    raise Exception("IPolicyConfig unavailable")
-
-
-class MicGuard:
-    """上下文管理器: 录音时把系统默认麦克风切到回退设备, 阻止其他 app 拿到我们说的话
-
-    用法:
-        g = MicGuard()
-        g.__enter__()         # 切换 (无回退设备时抛异常)
-        ... 录音 ...
-        g.__exit__(...)       # 恢复
-
-    副作用: 切换瞬间其他从默认设备取数据的 app 会断流 (可能闪退/重连),
-            退出 __exit__ 后立即恢复。
-    """
-
-    def __init__(self):
-        self._orig_id = None
-        self._fallback_id = None
-        self._fallback_was_inactive = False  # 修复: 原代码漏初始化, _restore 引用会 AttributeError
-
-    def __enter__(self):
-        self._switch()
-        _mic_guard_state["orig_id"] = self._orig_id  # 供 tray_exit 兜底恢复
-        return self
-
-    def __exit__(self, *args):
-        if self._orig_id:
-            try:
-                _policy_set_default(self._orig_id)
-                log("MicGuard: default restored")
-            except Exception as e:
-                log(f"MicGuard restore: {e}")
-        _mic_guard_state["orig_id"] = None
-
-    def _switch(self):
-        mmde = c_void_p()
-        hr = ole32.CoCreateInstance(
-            byref(_guid(CLSID_MMDeviceEnumerator)), c_void_p(), c_ulong(CLSCTX_INPROC),
-            byref(_guid(IID_IMMDeviceEnumerator)), byref(mmde))
-        if hr < 0: raise Exception(f"CoCreateInstance MMDE failed 0x{hr:X}")
-
-        cur = c_void_p()
-        _com_vtbl_call(mmde, 4, ctypes.c_long, c_int, c_int, POINTER(c_void_p))(
-            mmde, eCapture, eConsole, byref(cur))
-        if not cur.value: raise Exception("no default capture device")
-        self._orig_id = _com_get_device_id(cur.value)
-        if not self._orig_id: raise Exception("can't get device id")
-        log(f"MicGuard: orig default = {self._orig_id[:40]}...")
-
-        # 找回退设备: 第一个活跃且非默认的
-        fallback = None
-        col = c_void_p()
-        _com_vtbl_call(mmde, 3, ctypes.c_long, c_int, c_uint, POINTER(c_void_p))(
-            mmde, eCapture, DEVICE_STATE_ACTIVE, byref(col))
-        if col.value:
-            cnt = c_uint()
-            _com_vtbl_call(col, 3, ctypes.c_long, POINTER(c_uint))(col, byref(cnt))
-            for i in range(cnt.value):
-                dev = c_void_p()
-                _com_vtbl_call(col, 4, ctypes.c_long, c_uint, POINTER(c_void_p))(
-                    col, c_uint(i), byref(dev))
-                if not dev.value: continue
-                did = _com_get_device_id(dev.value)
-                if did and did != self._orig_id:
-                    fallback = did
-                    log(f"MicGuard: fallback = {did[:40]}...")
-                    break
-        if not fallback:
-            raise Exception("no fallback device (需要至少 2 个录音设备才能独占)")
-
-        self._fallback_id = fallback
-        _policy_set_default(fallback)
-        log("MicGuard: default -> fallback (其他 app 已切走)")
-        time.sleep(0.15)  # 等其他 app 释放对原设备的访问
-
-    def _set_visibility(self, device_id, visible):
-        """IPolicyConfig::SetEndpointVisibility — 启用/禁用设备 (vtable=14)"""
-        for iid_name, iid in [("10", IID_PolicyConfig10), ("def", IID_PolicyConfig), ("v", IID_PolicyConfigV)]:
-            pc = c_void_p()
-            hr = ole32.CoCreateInstance(
-                byref(_guid(CLSID_PolicyConfig)), c_void_p(), c_ulong(CLSCTX_INPROC),
-                byref(_guid(iid)), byref(pc))
-            if hr >= 0 and pc.value:
-                hr2 = _com_vtbl_call(pc, 14, ctypes.c_long, c_wchar_p, c_int)(
-                    pc, device_id, visible)
-                log(f"MicGuard visibility [{iid_name}] visible={visible} hr=0x{hr2:X}")
-                if hr2 == 0: return True
-        return False
-
-    # 注: SetDefault 逻辑已上提到模块级 _policy_set_default, 供 tray_exit 兜底调用
-
-
 # ═══════════════════════════════════════════════════════════
 #  配置
 # ═══════════════════════════════════════════════════════════
@@ -455,7 +340,7 @@ DEFAULT_CONFIG = {
     "chunk_size": 1024,
     "input_device_index": None,
     "auto_start": True,
-    "exclusive_device": True,  # 录音时独占音频设备 (WASAPI 独占 + 切默认麦克风)
+    "exclusive_device": True,  # 录音时优先尝试 WASAPI 独占; 不修改系统默认输入设备
     "language": "auto",         # auto / zh / en / ja / ko / yue
     "model_dir": "",            # 模型目录; 留空时按优先级自动搜索
     "floating_bubble": False,  # 关闭主窗口后是否显示悬浮气泡 (默认关闭)
@@ -548,7 +433,7 @@ def set_auto_start(enabled: bool):
 config = {}
 state = {"enabled": True, "recording": False, "engine": "none",
          "last_text": "", "raw_text": "", "last_error": "", "audio_mode": "共享",
-         "mic_guarded": False, "exclusive": True}
+         "exclusive": True}
 ui_queue = queue_mod.Queue()
 
 
@@ -995,8 +880,6 @@ _current_recorder = None  # 当前录音实例, UI 动画线程从这里读音�
 def recording_flow():
     global _paste_count, _current_recorder
     rec = None
-    mic_guard = None
-    mic_guard_active = False
     exclusive_on = config.get("exclusive_device", True)
     state["exclusive"] = exclusive_on
     try:
@@ -1007,41 +890,16 @@ def recording_flow():
         log(f"录音中 ({rec.mode}模式)...")
 
         # 1) 先开音频流, 绑定到具体设备 (PortAudio 内部抓的是物理设备句柄,
-        #    不依赖"系统默认设备", 后面 MicGuard 切默认不会影响本流)
+        #    不依赖"系统默认设备"; Vernest 不再改 Windows 默认输入设备)
         rec.start()
-
-        # 2) 切走系统默认麦克风 (仅在 exclusive_device=True 时)
-        #    切走后, 从默认设备取音频的所有 app (Discord/QQ/飞书) 会断流,
-        #    拿不到我们说的内容; 松开 Ctrl 立即切回
         if exclusive_on:
-            mic_guard = MicGuard()
-            try:
-                mic_guard.__enter__()
-                mic_guard_active = True
-                state["mic_guarded"] = True
-                log("MicGuard 激活: 系统默认麦克风已切到回退设备")
-            except Exception as e:
-                log(f"MicGuard 启动失败 (继续录音, 其他 app 可能仍能听到): {e}")
-                mic_guard_active = False
-                state["mic_guarded"] = False
+            log("独占设备已开启: 仅尝试 WASAPI 独占录音, 不切换系统默认输入设备")
         else:
-            log("独占设备已关闭: 跳过 MicGuard, 其他 app 可正常获取音频")
-            state["mic_guarded"] = False
-        ui_queue.put(("status", None))  # 触发 _refresh 更新 [独占] 标签
+            log("独占设备已关闭: 使用共享录音, 不切换系统默认输入设备")
+        ui_queue.put(("status", None))  # 触发 UI 更新音频模式
 
-        # 3) 录音循环
+        # 2) 录音循环
         while state["recording"]: time.sleep(0.05)
-
-        # 4) 先恢复 MicGuard (其他 app 立即可用), 再关流
-        if mic_guard_active:
-            try:
-                mic_guard.__exit__(None, None, None)
-                log("MicGuard 已恢复默认麦克风")
-            except Exception as e:
-                log(f"MicGuard 恢复失败: {e}")
-            mic_guard_active = False
-            state["mic_guarded"] = False
-            ui_queue.put(("status", None))
 
         frames = rec.stop()
         ui_queue.put(("recording", False))
@@ -1070,14 +928,6 @@ def recording_flow():
         log(f"录音错误: {e}\n{traceback.format_exc()}")
         ui_queue.put(("error", f"录音: {e}"))
     finally:
-        # 兜底: 任何路径退出都恢复 MicGuard, 不让系统默认麦克风卡在回退设备
-        if mic_guard_active and mic_guard is not None:
-            try:
-                mic_guard.__exit__(None, None, None)
-                state["mic_guarded"] = False
-                log("MicGuard 兜底恢复")
-            except Exception as e:
-                log(f"finally MicGuard 恢复失败: {e}")
         if rec is not None:
             try: rec.close()
             except Exception: pass
