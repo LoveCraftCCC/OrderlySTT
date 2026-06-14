@@ -1,6 +1,6 @@
 [package]
 name = "vernest-desktop"
-version = "0.8.1"
+version = "0.8.2"
 description = "Vernest desktop voice input"
 authors = ["孙欣阳"]
 homepage = "https://github.com/Xinyang-S/STT-YanQi/tree/main"

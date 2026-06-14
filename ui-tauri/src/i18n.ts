@@ -2,7 +2,7 @@ export const product = {
   zhName: "Vernest",
   enName: "Voice Input",
   displayName: "Vernest",
-  version: "0.8.1",
+  version: "0.8.2",
   copyright: "Copyright © 2026 孙欣阳. All rights reserved.",
 };
 

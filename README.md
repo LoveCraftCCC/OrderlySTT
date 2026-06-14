@@ -4,7 +4,7 @@
 
 言栖 Vernest 是一款 Windows 桌面语音输入工具。应用按住快捷键录音，松开后在本机完成识别并粘贴到当前光标位置。
 
-当前版本：`0.8.1`  
+当前版本：`0.8.2`  
 作者：孙欣阳  
 项目主页：<https://github.com/Xinyang-S/STT-YanQi/tree/main>  
 版权：Copyright © 2026 孙欣阳. All rights reserved.
@@ -93,7 +93,7 @@ npm run tauri -- dev
 浅层安装包：
 
 ```text
-release\Vernest_0.8.1_x64-setup.exe
+release\Vernest_0.8.2_x64-setup.exe
 ```
 
 浅层便携版主程序：
@@ -105,7 +105,7 @@ release\Vernest\Vernest.exe
 便携版 zip：
 
 ```text
-release\Vernest-0.8.1-windows-x64-portable.zip
+release\Vernest-0.8.2-windows-x64-portable.zip
 ```
 
 代码签名预留脚本：

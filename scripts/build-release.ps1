@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-$Version = "0.8.1"
+$Version = "0.8.2"
 $Ui = Join-Path $Root "ui-tauri"
 $ReleaseRoot = Join-Path $Root "release"
 $TauriRelease = Join-Path $Ui "src-tauri\target\release"
@@ -81,10 +81,16 @@ if ($SkipPortable) {
 }
 
 New-Item -ItemType Directory -Force -Path $ReleaseRoot | Out-Null
-Get-ChildItem -LiteralPath $ReleaseRoot -File -Filter "言栖_*_x64-setup.exe" -ErrorAction SilentlyContinue |
-  Remove-Item -Force
 $InstallerTargetName = "Vernest_$($Version)_x64-setup.exe"
 $InstallerTarget = Join-Path $ReleaseRoot $InstallerTargetName
+Get-ChildItem -LiteralPath $ReleaseRoot -File -Filter "言栖_*_x64-setup.exe" -ErrorAction SilentlyContinue |
+  Remove-Item -Force
+Get-ChildItem -LiteralPath $ReleaseRoot -File -Filter "Vernest_*_x64-setup.exe" -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -ne $InstallerTargetName } |
+  Remove-Item -Force
+Get-ChildItem -LiteralPath $ReleaseRoot -File -Filter "Vernest-*-windows-x64-portable.zip" -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -ne (Split-Path -Leaf $PortableZip) } |
+  Remove-Item -Force
 foreach ($Path in @($InstallerTarget, $PortableZip)) {
   if (Test-Path -LiteralPath $Path) {
     Remove-Item -LiteralPath $Path -Force
