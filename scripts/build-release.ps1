@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
-$Version = "0.8.2"
+$Version = "0.8.3"
 $Ui = Join-Path $Root "ui-tauri"
 $ReleaseRoot = Join-Path $Root "release"
 $TauriRelease = Join-Path $Ui "src-tauri\target\release"

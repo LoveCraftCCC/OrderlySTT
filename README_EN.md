@@ -4,7 +4,7 @@
 
 Vernest, known as 言栖 in Chinese, is a Windows desktop voice input tool. Hold a shortcut to record, release it to transcribe locally, and paste the result into the current cursor position.
 
-Current version: `0.8.2`  
+Current version: `0.8.3`  
 Author: 孙欣阳  
 Project homepage: <https://github.com/Xinyang-S/STT-YanQi/tree/main>  
 Copyright: Copyright © 2026 孙欣阳. All rights reserved.
@@ -93,7 +93,7 @@ Text polishing is planned as a future cloud-model feature. The current release d
 Shallow NSIS installer:
 
 ```text
-release\Vernest_0.8.2_x64-setup.exe
+release\Vernest_0.8.3_x64-setup.exe
 ```
 
 Shallow portable app:
@@ -105,7 +105,7 @@ release\Vernest\Vernest.exe
 Portable zip:
 
 ```text
-release\Vernest-0.8.2-windows-x64-portable.zip
+release\Vernest-0.8.3-windows-x64-portable.zip
 ```
 
 Code signing placeholder:
