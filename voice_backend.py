@@ -175,7 +175,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "floating_bubble" in data:
                     core.config["floating_bubble"] = bool(data["floating_bubble"])
                 if "input_device_index" in data:
-                    core.config["input_device_index"] = data["input_device_index"]
+                    core.config["input_device_index"] = core.normalize_input_device_index(data["input_device_index"])
                 core.save_config()
                 backend_state.touch("config")
                 self._send({"ok": True, "state": backend_state.snapshot()})

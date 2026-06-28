@@ -40,6 +40,11 @@ type ShortcutConfig = {
   label: string;
 };
 
+type AutostartConfig = {
+  enabled: boolean;
+  supported: boolean;
+};
+
 const accentOptions = ["#007aff", "#00a88f", "#ff8a2a", "#ff4f8b", "#7d6bff"];
 
 const defaultShortcut: ShortcutConfig = {
@@ -116,12 +121,21 @@ function keyCodeFromEvent(event: globalThis.KeyboardEvent): number {
   return byCode[event.code] || event.keyCode || event.which || 0;
 }
 
-function modifierKeysFromEvent(event: globalThis.KeyboardEvent | globalThis.MouseEvent, mainCode?: number): number[] {
+function modifierKeysFromCapturedCodes(codes: number[], mainCode?: number): number[] {
+  const hasAny = (...candidates: number[]) => codes.some((code) => candidates.includes(code));
   const keys: number[] = [];
-  if (event.ctrlKey && mainCode !== 0xa2 && mainCode !== 0xa3) keys.push(genericModifierCodes.ctrl);
-  if (event.shiftKey && mainCode !== 0xa0 && mainCode !== 0xa1) keys.push(genericModifierCodes.shift);
-  if (event.altKey && mainCode !== 0xa4 && mainCode !== 0xa5) keys.push(genericModifierCodes.alt);
-  if (event.metaKey && mainCode !== 0x5b && mainCode !== 0x5c) keys.push(genericModifierCodes.meta);
+  if (hasAny(0x11, 0xa2, 0xa3) && mainCode !== 0x11 && mainCode !== 0xa2 && mainCode !== 0xa3) {
+    keys.push(genericModifierCodes.ctrl);
+  }
+  if (hasAny(0x10, 0xa0, 0xa1) && mainCode !== 0x10 && mainCode !== 0xa0 && mainCode !== 0xa1) {
+    keys.push(genericModifierCodes.shift);
+  }
+  if (hasAny(0x12, 0xa4, 0xa5) && mainCode !== 0x12 && mainCode !== 0xa4 && mainCode !== 0xa5) {
+    keys.push(genericModifierCodes.alt);
+  }
+  if (hasAny(0x5b, 0x5c) && mainCode !== 0x5b && mainCode !== 0x5c) {
+    keys.push(genericModifierCodes.meta);
+  }
   return keys;
 }
 
@@ -201,11 +215,14 @@ function App() {
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [appearance, setAppearance] = useState<AppearanceConfig>(loadAppearance);
   const [shortcut, setShortcut] = useState<ShortcutConfig>(defaultShortcut);
+  const [autostart, setAutostart] = useState<AutostartConfig>({ enabled: true, supported: true });
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [capturingShortcut, setCapturingShortcut] = useState(false);
   const [diagnosticPath, setDiagnosticPath] = useState("");
   const [copied, setCopied] = useState(false);
   const pointerRecording = useRef(false);
   const shortcutModifierKeys = useRef<number[]>([]);
+  const shortcutCaptureCommitted = useRef(false);
   const backendToken = useRef("");
 
   const refresh = useCallback(async () => {
@@ -238,6 +255,9 @@ function App() {
     void invoke<ShortcutConfig>("get_shortcut_config")
       .then(setShortcut)
       .catch(() => setShortcut(defaultShortcut));
+    void invoke<AutostartConfig>("get_autostart_config")
+      .then(setAutostart)
+      .catch(() => setAutostart({ enabled: false, supported: false }));
   }, [refresh, refreshDevices]);
 
   const applyShortcut = useCallback(async (next: ShortcutConfig) => {
@@ -246,11 +266,23 @@ function App() {
     setCapturingShortcut(false);
   }, []);
 
+  const commitCapturedShortcut = useCallback(async (next: ShortcutConfig) => {
+    if (shortcutCaptureCommitted.current) return;
+    shortcutCaptureCommitted.current = true;
+    try {
+      await applyShortcut(next);
+    } catch {
+      shortcutCaptureCommitted.current = false;
+    }
+  }, [applyShortcut]);
+
   useEffect(() => {
     if (!capturingShortcut) return undefined;
     shortcutModifierKeys.current = [];
+    shortcutCaptureCommitted.current = false;
 
     const captureKeyboard = (event: globalThis.KeyboardEvent) => {
+      if (shortcutCaptureCommitted.current) return;
       event.preventDefault();
       event.stopPropagation();
 
@@ -265,28 +297,30 @@ function App() {
         return;
       }
 
-      const next = normalizeShortcut([...modifierKeysFromEvent(event, mainCode), mainCode], []);
-      if (next) void applyShortcut(next);
+      const next = normalizeShortcut([...modifierKeysFromCapturedCodes(shortcutModifierKeys.current, mainCode), mainCode], []);
+      if (next) void commitCapturedShortcut(next);
     };
 
     const captureKeyboardRelease = (event: globalThis.KeyboardEvent) => {
+      if (shortcutCaptureCommitted.current) return;
       if (!shortcutModifierKeys.current.length) return;
       event.preventDefault();
       event.stopPropagation();
 
       const next = normalizeShortcut(shortcutModifierKeys.current, []);
-      if (next) void applyShortcut(next);
+      if (next) void commitCapturedShortcut(next);
     };
 
     const captureMouse = (event: globalThis.MouseEvent) => {
+      if (shortcutCaptureCommitted.current) return;
       if ((event.target as Element | null)?.closest("[data-shortcut-control='true']")) return;
       event.preventDefault();
       event.stopPropagation();
 
       const button = mouseButtonFromEvent(event);
       if (!button) return;
-      const next = normalizeShortcut(modifierKeysFromEvent(event), [button]);
-      if (next) void applyShortcut(next);
+      const next = normalizeShortcut(modifierKeysFromCapturedCodes(shortcutModifierKeys.current), [button]);
+      if (next) void commitCapturedShortcut(next);
     };
 
     const blockContextMenu = (event: globalThis.MouseEvent) => {
@@ -301,12 +335,13 @@ function App() {
     window.addEventListener("contextmenu", blockContextMenu, true);
     return () => {
       shortcutModifierKeys.current = [];
+      shortcutCaptureCommitted.current = false;
       window.removeEventListener("keydown", captureKeyboard, true);
       window.removeEventListener("keyup", captureKeyboardRelease, true);
       window.removeEventListener("mousedown", captureMouse, true);
       window.removeEventListener("contextmenu", blockContextMenu, true);
     };
-  }, [applyShortcut, capturingShortcut]);
+  }, [capturingShortcut, commitCapturedShortcut]);
 
   useEffect(() => {
     if (!settingsOpen) setCapturingShortcut(false);
@@ -461,6 +496,20 @@ function App() {
     }
   }
 
+  async function updateAutostart(enabled: boolean) {
+    const previous = autostart;
+    setAutostart((current) => ({ ...current, enabled }));
+    setAutostartBusy(true);
+    try {
+      const saved = await invoke<AutostartConfig>("set_autostart_config", { enabled });
+      setAutostart(saved);
+    } catch {
+      setAutostart(previous);
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
+
   function startWindowDrag(event: PointerEvent<HTMLElement>) {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -523,7 +572,7 @@ function App() {
           aria-label="悬浮录音"
         >
           <span className="bubble-glow" />
-          <span className="bubble-core">{state.recording ? <Pause size={18} /> : <Mic2 size={20} />}</span>
+          <span className="bubble-core">{state.recording ? <Pause size={13} /> : <Mic2 size={15} />}</span>
         </button>
       </main>
     );
@@ -673,6 +722,19 @@ function App() {
                 type="checkbox"
                 checked={state.floating_bubble}
                 onChange={(e) => post("/api/config", { floating_bubble: e.currentTarget.checked })}
+              />
+            </label>
+
+            <label className="toggle-row">
+              <span>
+                <strong>开机自启动</strong>
+                <em>{autostart.supported ? "登录 Windows 后自动启动 Vernest" : "当前系统暂不支持"}</em>
+              </span>
+              <input
+                type="checkbox"
+                checked={autostart.enabled}
+                disabled={!autostart.supported || autostartBusy}
+                onChange={(e) => void updateAutostart(e.currentTarget.checked)}
               />
             </label>
 

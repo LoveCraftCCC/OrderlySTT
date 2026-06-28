@@ -29,9 +29,18 @@ use product::{
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, LRESULT, WPARAM},
+    Foundation::{
+        GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+        ERROR_SUCCESS, LPARAM, LRESULT, WPARAM,
+    },
     Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC, SND_SYSTEM},
-    System::Threading::CreateMutexW,
+    System::{
+        Registry::{
+            RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
+            HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
+        },
+        Threading::CreateMutexW,
+    },
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1,
@@ -128,6 +137,9 @@ struct PromptSoundRequest {
     min_gap_ms: u64,
 }
 
+const AUTOSTART_VALUE_NAME: &str = "Vernest";
+const AUTOSTART_RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
 static BACKEND_PORT: AtomicU16 = AtomicU16::new(47632);
 static LAST_TOGGLE_MS: AtomicU64 = AtomicU64::new(0);
 static BACKEND_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -156,6 +168,23 @@ struct BackendInfo {
     app_data_dir: String,
     version: String,
     running: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct AutostartConfig {
+    enabled: bool,
+}
+
+impl Default for AutostartConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AutostartStatus {
+    enabled: bool,
+    supported: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -325,6 +354,181 @@ fn save_shortcut_config(config: &ShortcutConfig) -> Result<(), String> {
     fs::write(path, content).map_err(|err| err.to_string())
 }
 
+fn autostart_config_path() -> PathBuf {
+    app_data_dir().join("autostart.json")
+}
+
+fn load_autostart_config() -> AutostartConfig {
+    fs::read_to_string(autostart_config_path())
+        .ok()
+        .and_then(|content| serde_json::from_str::<AutostartConfig>(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_autostart_config(config: &AutostartConfig) -> Result<(), String> {
+    let path = autostart_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(config).map_err(|err| err.to_string())?;
+    fs::write(path, content).map_err(|err| err.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn autostart_supported() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn autostart_supported() -> bool {
+    false
+}
+
+fn current_autostart_status() -> AutostartStatus {
+    let supported = autostart_supported();
+    AutostartStatus {
+        enabled: supported && load_autostart_config().enabled,
+        supported,
+    }
+}
+
+fn sync_autostart_on_launch() {
+    let config = load_autostart_config();
+    if autostart_supported() {
+        if let Err(err) = apply_autostart_preference(config.enabled) {
+            eprintln!("failed to sync Vernest autostart preference: {err}");
+        }
+    }
+    if let Err(err) = save_autostart_config(&config) {
+        eprintln!("failed to save Vernest autostart preference: {err}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain([0]).collect()
+}
+
+#[cfg(target_os = "windows")]
+struct RegistryKey(HKEY);
+
+#[cfg(target_os = "windows")]
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RegCloseKey(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn registry_error(context: &str, code: u32) -> String {
+    format!("{context} failed with Windows error {code}")
+}
+
+#[cfg(target_os = "windows")]
+fn open_autostart_key(access: u32, create: bool) -> Result<Option<RegistryKey>, String> {
+    let subkey = to_wide(AUTOSTART_RUN_SUBKEY);
+    let mut key: HKEY = std::ptr::null_mut();
+
+    let result = unsafe {
+        if create {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                access,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            )
+        } else {
+            RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key)
+        }
+    };
+
+    if !create && matches!(result, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+        return Ok(None);
+    }
+    if result != ERROR_SUCCESS {
+        return Err(registry_error("open autostart registry key", result));
+    }
+
+    Ok(Some(RegistryKey(key)))
+}
+
+#[cfg(target_os = "windows")]
+fn current_exe_launch_command() -> Result<String, String> {
+    let exe_path = std::env::current_exe().map_err(|err| err.to_string())?;
+    Ok(format!("\"{}\"", exe_path.to_string_lossy()))
+}
+
+#[cfg(target_os = "windows")]
+fn enable_autostart_registry() -> Result<(), String> {
+    let command = current_exe_launch_command()?;
+    let Some(key) = open_autostart_key(KEY_WRITE, true)? else {
+        return Err("无法打开开机自启动注册表项".to_string());
+    };
+
+    let value_name = to_wide(AUTOSTART_VALUE_NAME);
+    let value_data = to_wide(&command);
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            value_data.as_ptr() as *const u8,
+            value_data.len() * std::mem::size_of::<u16>(),
+        )
+    };
+    let result = unsafe {
+        RegSetValueExW(
+            key.0,
+            value_name.as_ptr(),
+            0,
+            REG_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+
+    if result != ERROR_SUCCESS {
+        return Err(registry_error("enable autostart", result));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn disable_autostart_registry() -> Result<(), String> {
+    let Some(key) = open_autostart_key(KEY_READ | KEY_WRITE, false)? else {
+        return Ok(());
+    };
+    let value_name = to_wide(AUTOSTART_VALUE_NAME);
+    let result = unsafe { RegDeleteValueW(key.0, value_name.as_ptr()) };
+
+    if matches!(result, ERROR_SUCCESS | ERROR_FILE_NOT_FOUND) {
+        return Ok(());
+    }
+    Err(registry_error("disable autostart", result))
+}
+
+#[cfg(target_os = "windows")]
+fn apply_autostart_preference(enabled: bool) -> Result<(), String> {
+    if enabled {
+        enable_autostart_registry()
+    } else {
+        disable_autostart_registry()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_autostart_preference(enabled: bool) -> Result<(), String> {
+    if enabled {
+        Err("当前系统不支持开机自启动".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn current_shortcut_config() -> ShortcutConfig {
     shortcut_config_store()
         .lock()
@@ -332,12 +536,16 @@ fn current_shortcut_config() -> ShortcutConfig {
         .unwrap_or_default()
 }
 
-fn reset_shortcut_input_state() -> bool {
+fn reset_shortcut_input_state_for_config(config: &ShortcutConfig) -> bool {
     shortcut_state()
         .lock()
         .map(|mut state| {
             let was_recording = state.recording;
             *state = ShortcutState::default();
+            seed_pressed_inputs_from_physical_state(&mut state, config);
+            refresh_modifier_state(&mut state);
+            state.shortcut_active = shortcut_inputs_down(&state, config);
+            state.last_input_ms = now_ms();
             was_recording
         })
         .unwrap_or(false)
@@ -404,6 +612,66 @@ fn refresh_modifier_state(state: &mut ShortcutState) {
         .iter()
         .any(|code| matches!(*code, VK_SHIFT_CODE | VK_LSHIFT_CODE | VK_RSHIFT_CODE));
 }
+
+#[cfg(target_os = "windows")]
+fn raw_key_physically_down(vk_code: u32) -> bool {
+    unsafe { (GetAsyncKeyState(vk_code as i32) as u16) & 0x8000 != 0 }
+}
+
+#[cfg(target_os = "windows")]
+fn seed_generic_modifier_state(state: &mut ShortcutState, generic: u32, left: u32, right: u32) {
+    let mut seeded = false;
+    if raw_key_physically_down(left) {
+        update_pressed_u32(&mut state.pressed_keys, left, true);
+        seeded = true;
+    }
+    if raw_key_physically_down(right) {
+        update_pressed_u32(&mut state.pressed_keys, right, true);
+        seeded = true;
+    }
+    if !seeded && raw_key_physically_down(generic) {
+        update_pressed_u32(&mut state.pressed_keys, generic, true);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn seed_pressed_inputs_from_physical_state(state: &mut ShortcutState, config: &ShortcutConfig) {
+    for code in &config.keys {
+        match *code {
+            VK_CONTROL_CODE => seed_generic_modifier_state(
+                state,
+                VK_CONTROL_CODE,
+                VK_LCONTROL_CODE,
+                VK_RCONTROL_CODE,
+            ),
+            VK_SHIFT_CODE => {
+                seed_generic_modifier_state(state, VK_SHIFT_CODE, VK_LSHIFT_CODE, VK_RSHIFT_CODE)
+            }
+            VK_MENU_CODE => {
+                seed_generic_modifier_state(state, VK_MENU_CODE, VK_LMENU_CODE, VK_RMENU_CODE)
+            }
+            VK_LCONTROL_CODE | VK_RCONTROL_CODE | VK_LSHIFT_CODE | VK_RSHIFT_CODE
+            | VK_LMENU_CODE | VK_RMENU_CODE => {
+                if raw_key_physically_down(*code) {
+                    update_pressed_u32(&mut state.pressed_keys, *code, true);
+                }
+            }
+            _ if shortcut_key_physically_down(*code) => {
+                update_pressed_u32(&mut state.pressed_keys, *code, true)
+            }
+            _ => {}
+        }
+    }
+
+    for button in &config.mouse_buttons {
+        if shortcut_mouse_physically_down(*button) {
+            update_pressed_u16(&mut state.pressed_mouse_buttons, *button, true);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn seed_pressed_inputs_from_physical_state(_state: &mut ShortcutState, _config: &ShortcutConfig) {}
 
 fn backend_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -670,7 +938,7 @@ const SILENCE_WAV_BYTES: &[u8] = &[
 #[cfg(target_os = "windows")]
 fn sound_dedupe_ms(sound: PromptSound) -> u64 {
     match sound {
-        PromptSound::Start => 250,
+        PromptSound::Start => 0,
         PromptSound::Done => 700,
         PromptSound::ToggleOn | PromptSound::ToggleOff => 180,
         PromptSound::Error => 300,
@@ -1046,7 +1314,7 @@ fn handle_shortcut_mouse(button: u16, pressed: bool) {
 }
 
 #[cfg(target_os = "windows")]
-fn normalize_control_key(vk_code: u32, flags: u32, pressed: bool) -> u32 {
+fn normalize_keyboard_key(vk_code: u32, flags: u32, pressed: bool) -> u32 {
     if vk_code == u32::from(VK_CONTROL) {
         let right_control_down = shortcut_state()
             .lock()
@@ -1058,7 +1326,11 @@ fn normalize_control_key(vk_code: u32, flags: u32, pressed: bool) -> u32 {
             VK_LCONTROL_CODE
         }
     } else if vk_code == VK_MENU_CODE {
-        if flags & 0x01 != 0 {
+        let right_alt_down = shortcut_state()
+            .lock()
+            .map(|state| state.pressed_keys.contains(&VK_RMENU_CODE))
+            .unwrap_or(false);
+        if flags & 0x01 != 0 || (!pressed && right_alt_down) {
             VK_RMENU_CODE
         } else {
             VK_LMENU_CODE
@@ -1076,7 +1348,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let released = message == WM_KEYUP || message == WM_SYSKEYUP;
         if pressed || released {
             let event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-            let vk_code = normalize_control_key(event.vkCode, event.flags, pressed);
+            let vk_code = normalize_keyboard_key(event.vkCode, event.flags, pressed);
             handle_shortcut_key(vk_code, pressed);
         }
     }
@@ -1141,17 +1413,32 @@ fn start_keyboard_hook(port: u16) {
 
 #[cfg(target_os = "windows")]
 fn shortcut_key_physically_down(vk_code: u32) -> bool {
-    let down = |code: u32| unsafe { (GetAsyncKeyState(code as i32) as u16) & 0x8000 != 0 };
     match vk_code {
         VK_CONTROL_CODE => {
-            down(VK_CONTROL_CODE) || down(VK_LCONTROL_CODE) || down(VK_RCONTROL_CODE)
+            raw_key_physically_down(VK_CONTROL_CODE)
+                || raw_key_physically_down(VK_LCONTROL_CODE)
+                || raw_key_physically_down(VK_RCONTROL_CODE)
         }
-        VK_LCONTROL_CODE | VK_RCONTROL_CODE => down(vk_code) || down(VK_CONTROL_CODE),
-        VK_SHIFT_CODE => down(VK_SHIFT_CODE) || down(VK_LSHIFT_CODE) || down(VK_RSHIFT_CODE),
-        VK_LSHIFT_CODE | VK_RSHIFT_CODE => down(vk_code) || down(VK_SHIFT_CODE),
-        VK_MENU_CODE => down(VK_MENU_CODE) || down(VK_LMENU_CODE) || down(VK_RMENU_CODE),
-        VK_LMENU_CODE | VK_RMENU_CODE => down(vk_code) || down(VK_MENU_CODE),
-        _ => down(vk_code),
+        VK_LCONTROL_CODE | VK_RCONTROL_CODE => {
+            raw_key_physically_down(vk_code) || raw_key_physically_down(VK_CONTROL_CODE)
+        }
+        VK_SHIFT_CODE => {
+            raw_key_physically_down(VK_SHIFT_CODE)
+                || raw_key_physically_down(VK_LSHIFT_CODE)
+                || raw_key_physically_down(VK_RSHIFT_CODE)
+        }
+        VK_LSHIFT_CODE | VK_RSHIFT_CODE => {
+            raw_key_physically_down(vk_code) || raw_key_physically_down(VK_SHIFT_CODE)
+        }
+        VK_MENU_CODE => {
+            raw_key_physically_down(VK_MENU_CODE)
+                || raw_key_physically_down(VK_LMENU_CODE)
+                || raw_key_physically_down(VK_RMENU_CODE)
+        }
+        VK_LMENU_CODE | VK_RMENU_CODE => {
+            raw_key_physically_down(vk_code) || raw_key_physically_down(VK_MENU_CODE)
+        }
+        _ => raw_key_physically_down(vk_code),
     }
 }
 
@@ -1305,7 +1592,7 @@ fn set_shortcut_config(config: ShortcutConfig) -> Result<ShortcutConfig, String>
         *current = normalized.clone();
     }
 
-    if reset_shortcut_input_state() {
+    if reset_shortcut_input_state_for_config(&normalized) {
         emit_recording_changed(false);
         let port = BACKEND_PORT.load(Ordering::Relaxed);
         thread::spawn(move || {
@@ -1316,13 +1603,30 @@ fn set_shortcut_config(config: ShortcutConfig) -> Result<ShortcutConfig, String>
     Ok(normalized)
 }
 
+#[tauri::command]
+fn get_autostart_config() -> AutostartStatus {
+    current_autostart_status()
+}
+
+#[tauri::command]
+fn set_autostart_config(enabled: bool) -> Result<AutostartStatus, String> {
+    if enabled && !autostart_supported() {
+        return Err("当前系统不支持开机自启动".to_string());
+    }
+
+    let config = AutostartConfig { enabled };
+    apply_autostart_preference(config.enabled)?;
+    save_autostart_config(&config)?;
+    Ok(current_autostart_status())
+}
+
 fn bubble_position(window: Option<&tauri::Window>) -> Option<(f64, f64)> {
     let monitor = window.and_then(|window| window.current_monitor().ok().flatten())?;
     let scale = monitor.scale_factor();
     let position = monitor.position();
     let size = monitor.size();
-    let x = position.x as f64 / scale + size.width as f64 / scale - 96.0;
-    let y = position.y as f64 / scale + size.height as f64 / scale - 124.0;
+    let x = position.x as f64 / scale + size.width as f64 / scale - 88.0;
+    let y = position.y as f64 / scale + size.height as f64 / scale - 92.0;
     Some((x.max(12.0), y.max(12.0)))
 }
 
@@ -1341,7 +1645,7 @@ fn show_bubble_window(
         WebviewUrl::App("index.html?view=bubble".into()),
     )
     .title("言栖悬浮气泡")
-    .inner_size(74.0, 74.0)
+    .inner_size(66.0, 34.0)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -1528,6 +1832,11 @@ mod tests {
     }
 
     #[test]
+    fn autostart_defaults_to_enabled() {
+        assert!(AutostartConfig::default().enabled);
+    }
+
+    #[test]
     fn redacts_recognition_log_content() {
         assert_eq!(
             redact_log_line("[12:00:00] 已粘贴: hello"),
@@ -1575,6 +1884,7 @@ pub fn run() {
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             let _ = shortcut_config_store();
+            sync_autostart_on_launch();
             start_sound_worker();
             start_keyboard_hook(port);
             start_shortcut_release_watcher();
@@ -1607,6 +1917,8 @@ pub fn run() {
             toggle_enabled,
             get_shortcut_config,
             set_shortcut_config,
+            get_autostart_config,
+            set_autostart_config,
             show_main_window,
             start_window_drag,
             export_diagnostics

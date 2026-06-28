@@ -451,6 +451,43 @@ def log(msg: str):
     except Exception:
         pass
 
+
+def normalize_input_device_index(device_index):
+    if device_index in (None, ""):
+        return None
+    try:
+        idx = int(device_index)
+    except (TypeError, ValueError):
+        log(f"输入设备索引无效, 已回退默认设备: {device_index!r}")
+        return None
+
+    p = None
+    try:
+        p = pyaudio.PyAudio()
+        if idx < 0 or idx >= p.get_device_count():
+            log(f"输入设备索引越界, 已回退默认设备: index={idx}")
+            return None
+        info = p.get_device_info_by_index(idx)
+        max_input_channels = int(info.get("maxInputChannels") or 0)
+        if max_input_channels <= 0:
+            log(
+                "输入设备索引指向非录音设备, 已回退默认设备: "
+                f"index={idx}, name={info.get('name')!r}, "
+                f"maxInputChannels={max_input_channels}"
+            )
+            return None
+        return idx
+    except Exception as e:
+        log(f"校验输入设备失败, 已回退默认设备: index={idx}, error={e!r}")
+        return None
+    finally:
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
 def _migrate_legacy_config_if_needed():
     if CONFIG_FILE.exists() or not LEGACY_CONFIG_FILE.exists():
         return
@@ -493,8 +530,13 @@ def load_config():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(next_config, f, indent=2, ensure_ascii=False)
 
+    original_input_device_index = next_config.get("input_device_index")
+    next_config["input_device_index"] = normalize_input_device_index(original_input_device_index)
+
     config.clear()
     config.update(next_config)
+    if config.get("input_device_index") != original_input_device_index:
+        save_config()
 
     # 本地引擎: sherpa-onnx 包 + 模型文件全部就绪才算"可用"
     d, t, m = _resolve_model_dir()
@@ -582,6 +624,8 @@ class LocalASR:
         try:
             import soundfile as sf
             samples, sr = sf.read(audio_path, dtype="float32")
+            if getattr(samples, "ndim", 1) > 1:
+                samples = samples.mean(axis=1)
             if sr != 16000:
                 log(f"音频采样率 {sr} != 16000, 自动重采样到 16000")
                 samples = _resample_to_16k(samples, sr)
@@ -621,6 +665,25 @@ def _resample_to_16k(samples, source_rate):
     src_x = np.linspace(0.0, duration, num=len(samples), endpoint=False)
     dst_x = np.linspace(0.0, duration, num=target_len, endpoint=False)
     return np.interp(dst_x, src_x, samples).astype(np.float32)
+
+
+def _downmix_int16_pcm_to_mono(raw, channels):
+    try:
+        channels = int(channels)
+    except Exception:
+        channels = 1
+    if channels <= 1 or not raw:
+        return raw
+
+    samples = np.frombuffer(raw, dtype=np.int16)
+    usable = (len(samples) // channels) * channels
+    if usable <= 0:
+        return b""
+    if usable != len(samples):
+        samples = samples[:usable]
+
+    mixed = samples.reshape(-1, channels).astype(np.int32).mean(axis=1)
+    return np.clip(np.rint(mixed), -32768, 32767).astype(np.int16).tobytes()
 
 
 class ASRManager:
@@ -676,6 +739,7 @@ class AudioRecorder:
         self._level_history = [0.0] * self._HIST_LEN  # 最近 N 帧 RMS, 给频谱条用
         self._mode = "共享"
         self.sample_rate = config["sample_rate"]
+        self.channels = int(config.get("channels", 1) or 1)
 
     def _candidate_sample_rates(self, device_index):
         preferred = int(config.get("sample_rate", 16000))
@@ -703,44 +767,93 @@ class AudioRecorder:
                 result.append(rate)
         return result
 
+    def _candidate_channels(self, device_index):
+        try:
+            preferred = int(config.get("channels", 1) or 1)
+        except Exception:
+            preferred = 1
+
+        max_channels = None
+        try:
+            if device_index is not None:
+                info = self.p.get_device_info_by_index(device_index)
+            else:
+                info = self.p.get_default_input_device_info()
+            max_channels = int(info.get("maxInputChannels") or 0)
+        except Exception as e:
+            log(f"读取设备通道数失败: {e!r}")
+
+        candidates = [preferred, 1, 2]
+        if max_channels:
+            candidates.append(max_channels)
+
+        seen = set()
+        result = []
+        for channels in candidates:
+            try:
+                channels = int(channels)
+            except Exception:
+                continue
+            if channels <= 0 or channels in seen:
+                continue
+            if max_channels and channels > max_channels:
+                continue
+            seen.add(channels)
+            result.append(channels)
+
+        return result or [1]
+
     def start(self):
         self.frames = []; self._active = True
-        idx = config.get("input_device_index")
+        raw_idx = config.get("input_device_index")
+        idx = normalize_input_device_index(raw_idx)
+        if idx != raw_idx:
+            config["input_device_index"] = idx
+            save_config()
         cb = self._cb
-        ch = config["channels"]; cs = config["chunk_size"]
+        cs = config["chunk_size"]
         sample_rates = self._candidate_sample_rates(idx)
+        channel_candidates = self._candidate_channels(idx)
         last_error = None
 
         # 1) 独占开关: 用户在设置中关闭 → 直接走共享模式 (不打扰其他 app)
         # 2) 独占开启 → 先尝试 WASAPI 独占, 失败回退共享
         if config.get("exclusive_device", True):
             for sr in sample_rates:
-                self.stream, self._mode = try_open_exclusive_stream(
-                    self.p, cb, sr, ch, cs, idx)
+                for ch in channel_candidates:
+                    self.stream, self._mode = try_open_exclusive_stream(
+                        self.p, cb, sr, ch, cs, idx)
+                    if self.stream is not None:
+                        self.sample_rate = sr
+                        self.channels = ch
+                        break
                 if self.stream is not None:
-                    self.sample_rate = sr
                     break
         else:
             self.stream, self._mode = None, "共享"
 
         if self.stream is None:
             for sr in sample_rates:
-                kw = dict(format=pyaudio.paInt16, channels=ch, rate=sr,
-                          input=True, frames_per_buffer=cs, stream_callback=cb)
-                if idx is not None: kw["input_device_index"] = idx
-                try:
-                    self.stream = self.p.open(**kw)
-                    self._mode = "共享"
-                    self.sample_rate = sr
+                for ch in channel_candidates:
+                    kw = dict(format=pyaudio.paInt16, channels=ch, rate=sr,
+                              input=True, frames_per_buffer=cs, stream_callback=cb)
+                    if idx is not None: kw["input_device_index"] = idx
+                    try:
+                        self.stream = self.p.open(**kw)
+                        self._mode = "共享"
+                        self.sample_rate = sr
+                        self.channels = ch
+                        break
+                    except Exception as e:
+                        last_error = e
+                        log(f"共享模式 sample_rate={sr}, channels={ch} 打开失败: {e!r}")
+                if self.stream is not None:
                     break
-                except Exception as e:
-                    last_error = e
-                    log(f"共享模式采样率 {sr} 打开失败: {e!r}")
             if self.stream is None and last_error is not None:
                 raise last_error
 
         state["audio_mode"] = self._mode
-        log(f"音频: {self._mode}模式, sample_rate={self.sample_rate}")
+        log(f"音频: {self._mode}模式, sample_rate={self.sample_rate}, channels={self.channels}->1")
 
     def _cb(self, data, fc, ti, st):
         if self._active:
@@ -765,9 +878,10 @@ class AudioRecorder:
         return self.frames
 
     def save(self, frames, path):
+        raw = _downmix_int16_pcm_to_mono(b"".join(frames), self.channels)
         with wave.open(path, "wb") as wf:
-            wf.setnchannels(config["channels"]); wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(self.sample_rate); wf.writeframes(b"".join(frames))
+            wf.setnchannels(1); wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(self.sample_rate); wf.writeframes(raw)
 
     def close(self): self.p.terminate()
 
