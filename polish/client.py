@@ -76,9 +76,7 @@ def dwell_and_capture(raw: str, polished: str, runtime_config: dict,
         except Exception as e:
             log(f"润色浮窗不可用, 直接上屏: {e}")
             final = polished
-    if cfg["learn_enabled"] and (final != polished or polished != raw):
-        triplet.record(raw, polished, final)
-    elif cfg["learn_enabled"]:
-        # 未修改也记录 (负样本, 用于统计修正率), 但降频: 每条都记, 离线再聚合
+    if cfg["learn_enabled"]:
+        # 未修改也记录 (负样本, 用于统计修正率), 离线再聚合
         triplet.record(raw, polished, final)
     return final
