@@ -38,6 +38,8 @@ def dwell_overlay(text: str, dwell_ms: int = 1500) -> str:
         entry.pack(fill="both", expand=True, padx=2, pady=2)
         root.configure(bg="#1e1e1e")
 
+        state = {"hwnd": None, "noactivate": True}
+
         def commit(_=None):
             if not result["done"]:
                 result["text"] = var.get()
@@ -46,6 +48,21 @@ def dwell_overlay(text: str, dwell_ms: int = 1500) -> str:
 
         def on_edit_start(_=None):
             root.after_cancel(auto_id[0])  # 用户上手 -> 取消自动提交
+            # NOACTIVATE 窗口收不到键盘焦点, Enter/Esc/编辑键全部失效.
+            # 首次交互时摘掉 NOACTIVATE 并显式 SetFocus, 让浮窗真正可编辑.
+            if state["noactivate"] and state["hwnd"]:
+                state["noactivate"] = False
+                try:
+                    GWL_EXSTYLE = -20
+                    WS_EX_NOACTIVATE = 0x08000000
+                    style = ctypes.windll.user32.GetWindowLongW(state["hwnd"], GWL_EXSTYLE)
+                    ctypes.windll.user32.SetWindowLongW(
+                        state["hwnd"], GWL_EXSTYLE, style & ~WS_EX_NOACTIVATE)
+                    ctypes.windll.user32.SetForegroundWindow(state["hwnd"])
+                    ctypes.windll.user32.SetFocus(state["hwnd"])
+                except Exception:
+                    pass
+                entry.focus_set()
 
         auto_id = [None]
         def schedule_auto():
@@ -60,6 +77,7 @@ def dwell_overlay(text: str, dwell_ms: int = 1500) -> str:
         root.update_idletasks()
         try:
             hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            state["hwnd"] = hwnd
             GWL_EXSTYLE = -20
             WS_EX_NOACTIVATE = 0x08000000
             WS_EX_TOOLWINDOW = 0x00000080
