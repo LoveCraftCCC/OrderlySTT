@@ -346,6 +346,14 @@ DEFAULT_CONFIG = {
     "floating_bubble": False,  # 关闭主窗口后是否显示悬浮气泡 (默认关闭)
     "bubble_x": None,           # 气泡 X 坐标 (持久化); None = 屏幕右侧默认
     "bubble_y": None,           # 气泡 Y 坐标 (持久化)
+    "polish": {                 # 润色层 (详见 polish/README.md)
+        "enabled": False,          # 默认关, 装好 polish server 后手动开
+        "endpoint": "http://127.0.0.1:47640",
+        "budget_ms": 800,
+        "dwell_enabled": True,
+        "dwell_ms": 1500,
+        "learn_enabled": True,
+    },
 }
 
 # sherpa-onnx SenseVoice 多语种模型 (int8) — 离线本地引擎, 唯一识别后端
@@ -1025,8 +1033,16 @@ def recording_flow():
         try:
             raw_txt, eng = asr.transcribe(apath)
             log(f"[{eng}] {raw_txt}")
-            txt = raw_txt
             state["raw_text"] = raw_txt
+            # ── 润色流水线: 词表快路径 -> 小模型 -> 驻留浮窗 + 三元组采集 ──
+            # 任何失败均静默降级为直接用原文, 绝不阻塞输入
+            try:
+                from polish.client import polish_with_timeout, dwell_and_capture
+                polished = polish_with_timeout(raw_txt, config)
+                txt = dwell_and_capture(raw_txt, polished, config, log=log)
+            except Exception as pe:
+                log(f"润色层降级 (直接用原文): {pe}")
+                txt = raw_txt
             state["last_text"] = txt; state["last_error"] = ""
             ui_queue.put(("result", txt)); ui_queue.put(("status", f"{eng} ({rec.mode}): {txt}"))
             _paste_count += 1
