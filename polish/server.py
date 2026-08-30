@@ -13,6 +13,7 @@
 
 import json
 import os
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,14 +32,17 @@ SYSTEM_PROMPT = (
 )
 
 _llm = None
+_llm_lock = threading.Lock()
 
 
 def _get_llamacpp():
     global _llm
     if _llm is None:
-        from llama_cpp import Llama
-        _llm = Llama(model_path=GGUF, n_ctx=1024, n_threads=os.cpu_count() or 4,
-                     verbose=False)
+        with _llm_lock:
+            if _llm is None:  # 双重检查, 防止并发首个请求把模型加载两遍
+                from llama_cpp import Llama
+                _llm = Llama(model_path=GGUF, n_ctx=1024,
+                             n_threads=os.cpu_count() or 4, verbose=False)
     return _llm
 
 
@@ -114,4 +118,12 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"polish server :{PORT} backend={BACKEND} model={MODEL or GGUF}")
+    if BACKEND == "llamacpp":
+        # 预热: 模型加载耗时数十秒, 不能让首个请求扛 (预算 800ms 必超)
+        print("预热: 加载 GGUF 模型...")
+        try:
+            _get_llamacpp()
+            print("预热完成")
+        except Exception as e:
+            print(f"预热失败 (llamacpp): {e}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
