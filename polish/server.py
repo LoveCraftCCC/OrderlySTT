@@ -51,7 +51,7 @@ def _polish_openai(text: str, budget_ms: int) -> str:
         "model": MODEL,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                      {"role": "user", "content": text}],
-        "temperature": 0.1, "max_tokens": max(64, len(text)),
+        "temperature": 0.1, "max_tokens": max(64, len(text) * 2),  # 中文 ~1.5-2 token/字, 防长句截断
     }).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if API_KEY:
@@ -68,7 +68,7 @@ def _polish_llamacpp(text: str, budget_ms: int) -> str:
     out = llm.create_chat_completion(
         messages=[{"role": "system", "content": SYSTEM_PROMPT},
                   {"role": "user", "content": text}],
-        temperature=0.1, max_tokens=max(64, len(text)))
+        temperature=0.1, max_tokens=max(64, len(text) * 2))
     return out["choices"][0]["message"]["content"].strip()
 
 
