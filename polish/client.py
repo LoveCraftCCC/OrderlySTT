@@ -13,7 +13,7 @@ from . import wordlist, triplet
 POLISH_DEFAULTS = {
     "enabled": False,
     "endpoint": "http://127.0.0.1:47640",
-    "budget_ms": 800,       # 小模型润色的总预算 (含网络)
+    "budget_ms": 1500,      # 润色总预算 (含网络); 云端往返实测 ~0.6-0.8s, 800 压线
     "dwell_enabled": True,  # 驻留浮窗
     "dwell_ms": 1500,       # 无操作自动上屏延时
     "learn_enabled": True,  # 三元组采集 + 词表学习
