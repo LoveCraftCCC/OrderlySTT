@@ -47,12 +47,16 @@ def _get_llamacpp():
 
 
 def _polish_openai(text: str, budget_ms: int) -> str:
-    payload = json.dumps({
+    body = {
         "model": MODEL,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                      {"role": "user", "content": text}],
         "temperature": 0.1, "max_tokens": max(64, len(text) * 2),  # 中文 ~1.5-2 token/字, 防长句截断
-    }).encode("utf-8")
+    }
+    # DeepSeek V4 系混合推理模型: 不显式关思考时 content 为空, 全预算被 reasoning 吃掉
+    if MODEL and ("deepseek" in MODEL.lower() or os.environ.get("POLISH_DISABLE_THINKING") == "1"):
+        body["thinking"] = {"type": "disabled"}
+    payload = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
