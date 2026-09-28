@@ -2,10 +2,10 @@
 """Vernest Linux 原生语音输入 (守护进程架构).
 
 子命令:
-  daemon   常驻: 预载模型, 监听 unix socket, 收到命令即录音->识别->润色->剪贴板
-  toggle   触发: 连 socket 发录音命令 (绑定 GNOME 快捷键)
+  daemon   常驻: 预载模型, 监听 unix socket
+  toggle   触发: F9 = 开始录音; 录音中再按 = 立即结束并提交
   once     一次性完整流水线 (测试用)
-  status   探活
+  status   探活 (真实 ping/pong 往返)
 """
 import array
 import json
@@ -58,7 +58,22 @@ def notify(title, body="", ms=2500):
         pass
 
 
-def record(cfg):
+def _drain_srv(srv):
+    """录音开始前排空积压连接 (旧按键不排队重放)."""
+    while True:
+        r, _, _ = select.select([srv], [], [], 0)
+        if not r:
+            return
+        try:
+            conn, _ = srv.accept()
+            conn.recv(64)
+            conn.close()
+        except Exception:
+            return
+
+
+def record(cfg, srv):
+    """多路复用: 同时监听麦克风与控制 socket. 再按 F9 = 立即停止并提交."""
     sr = cfg["sample_rate"]
     proc = subprocess.Popen(
         ["arecord", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "1", "-t", "raw"],
@@ -68,19 +83,36 @@ def record(cfg):
     silent_since = None
     t0 = time.monotonic()
     chunk_len = sr * 2 // 10  # 100ms
-    fd = proc.stdout.fileno()
+    afd = proc.stdout.fileno()
+    sfd = srv.fileno()
+    mic_no_data_reported = False
     while True:
-        # 看门狗: 麦克风无数据也绝不永久阻塞 (此 bug 曾令 daemon 假死)
-        r, _, _ = select.select([fd], [], [], 1.0)
-        if not r:
+        r, _, _ = select.select([afd, sfd], [], [], 0.2)
+        # 录音中再按 F9: 停止并提交
+        if sfd in r:
+            try:
+                conn, _ = srv.accept()
+                msg = conn.recv(64)
+                if msg == b"ping":
+                    try:
+                        conn.sendall(b"pong")
+                    except Exception:
+                        pass
+                conn.close()
+                if msg != b"ping":
+                    break
+            except Exception:
+                pass
+        # 看门狗: 麦克风无数据绝不永久阻塞
+        if afd not in r:
             now = time.monotonic()
-            if not frames and now - t0 > 3.0:
+            if not frames and now - t0 > 3.0 and not mic_no_data_reported:
                 notify("Vernest", "麦克风 3 秒无数据 (音频访问异常)", ms=4000)
-                break
+                mic_no_data_reported = True
             if now - t0 > cfg["max_seconds"]:
                 break
             continue
-        chunk = os.read(fd, chunk_len)
+        chunk = os.read(afd, chunk_len)
         if not chunk:
             break
         frames += chunk
@@ -172,12 +204,12 @@ def polish_deepseek(text, cfg):
         req = urllib.request.Request(
             "https://api.deepseek.com/chat/completions", data=body,
             headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + cfg["deepseek_key"]})
+                     "Authorization": "***" + cfg["deepseek_key"]})
         with op.open(req, timeout=8) as r:
             p = (json.loads(r.read().decode("utf-8"))["choices"][0]["message"]["content"] or "").strip()
             return p or text
     except Exception:
-        return text
+        return text  # 铁律: 润色失败绝不阻塞
 
 
 def polish(text, cfg):
@@ -204,9 +236,10 @@ def set_clipboard(text):
         pass
 
 
-def pipeline(cfg, engine):
-    notify("Vernest", "正在听…")
-    samples = record(cfg)
+def pipeline(cfg, engine, srv):
+    _drain_srv(srv)
+    notify("Vernest", "正在听… (再按 F9 立即提交)")
+    samples = record(cfg, srv)
     if len(samples) < cfg["sample_rate"] * 2 // 5:
         notify("Vernest", "太短了, 没听清")
         return
@@ -244,7 +277,7 @@ def daemon():
     print("daemon: loading model...", flush=True)
     engine = Engine(cfg)
     print("daemon: ready", flush=True)
-    notify("Vernest", "守护进程就绪, 按快捷键语音输入")
+    notify("Vernest", "守护进程就绪: F9 开始, 再按提交")
     while True:
         conn, _ = srv.accept()
         try:
@@ -255,7 +288,7 @@ def daemon():
                 except Exception:
                     pass
                 continue
-            pipeline(cfg, engine)
+            pipeline(cfg, engine, srv)
         except Exception:
             pass  # 单次流水线异常不拖垮守护
         finally:
@@ -276,7 +309,7 @@ def toggle():
 def status():
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.settimeout(2)
+        c.settimeout(3)
         c.connect(SOCK)
         c.send(b"ping")
         reply = c.recv(16)
@@ -289,7 +322,8 @@ def status():
 def once():
     cfg = load_cfg()
     engine = Engine(cfg)
-    pipeline(cfg, engine)
+    dummy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    pipeline(cfg, engine, dummy)
 
 
 def main():
