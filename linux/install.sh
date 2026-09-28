@@ -31,9 +31,10 @@ PY
   fi
 fi
 
-# XDG 开机自启
-mkdir -p "$HOME/.config/autostart"
-printf '[Desktop Entry]\nType=Application\nName=Vernest Voice Input\nExec=%s/vernest.py daemon\nX-GNOME-Autostart-enabled=true\n' "$PREFIX" > "$HOME/.config/autostart/vernest.desktop"
+# systemd 用户服务 (开机自启 + 崩溃自动重启, 不依赖 XDG 自启)
+mkdir -p "$HOME/.config/systemd/user"
+printf '[Unit]\nDescription=Vernest voice input daemon (OrderlySTT)\nAfter=graphical-session.target\n\n[Service]\nExecStart=%s/vernest.py daemon\nEnvironment=WAYLAND_DISPLAY=wayland-0\nEnvironment=DISPLAY=:0\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n' "$PREFIX" > "$HOME/.config/systemd/user/vernest-daemon.service"
+rm -f "$HOME/.config/autostart/vernest.desktop"
 
 # GNOME 快捷键 F9 (python 处理 GVariant 列表, 不破坏既有绑定)
 python3 - <<'PY'
@@ -52,9 +53,9 @@ subprocess.run(["gsettings", "set", K, "command", "/data/vernest/vernest.py togg
 print("  快捷键 F9 已绑定")
 PY
 
-# 启动守护进程 (若未运行)
-"$PREFIX/vernest.py" status 2>/dev/null | grep -q ALIVE || \
-  (setsid nohup "$PREFIX/vernest.py" daemon > "$PREFIX/daemon.log" 2>&1 &)
+# 启动守护进程 (systemd 管理, 若已运行则不动)
+systemctl --user daemon-reload
+systemctl --user enable --now vernest-daemon.service
 sleep 1
 echo "安装完成: F9 = 语音输入 | 重登自启 | 日志: $PREFIX/daemon.log"
 
