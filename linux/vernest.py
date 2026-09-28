@@ -10,6 +10,7 @@
 import array
 import json
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -67,8 +68,19 @@ def record(cfg):
     silent_since = None
     t0 = time.monotonic()
     chunk_len = sr * 2 // 10  # 100ms
+    fd = proc.stdout.fileno()
     while True:
-        chunk = proc.stdout.read(chunk_len)
+        # 看门狗: 麦克风无数据也绝不永久阻塞 (此 bug 曾令 daemon 假死)
+        r, _, _ = select.select([fd], [], [], 1.0)
+        if not r:
+            now = time.monotonic()
+            if not frames and now - t0 > 3.0:
+                notify("Vernest", "麦克风 3 秒无数据 (音频访问异常)", ms=4000)
+                break
+            if now - t0 > cfg["max_seconds"]:
+                break
+            continue
+        chunk = os.read(fd, chunk_len)
         if not chunk:
             break
         frames += chunk
@@ -87,15 +99,19 @@ def record(cfg):
         elif now - t0 > cfg["max_seconds"]:
             stop = True
         if stop:
-            proc.send_signal(signal.SIGINT)
-            try:
-                rest = proc.stdout.read()
-                if rest:
-                    frames += rest
-            except Exception:
-                pass
             break
-    proc.wait(timeout=5)
+    try:
+        proc.send_signal(signal.SIGINT)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
     return bytes(frames)
 
 
@@ -174,6 +190,7 @@ def set_clipboard(text):
     try:
         import gi
         gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
         from gi.repository import Gdk, Gtk
         cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         cb.set_text(text, -1)
@@ -210,7 +227,7 @@ def daemon():
         pass
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK)
-    srv.listen(1)
+    srv.listen(4)
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -231,8 +248,16 @@ def daemon():
     while True:
         conn, _ = srv.accept()
         try:
-            conn.recv(64)
+            msg = conn.recv(64)
+            if msg == b"ping":
+                try:
+                    conn.sendall(b"pong")
+                except Exception:
+                    pass
+                continue
             pipeline(cfg, engine)
+        except Exception:
+            pass  # 单次流水线异常不拖垮守护
         finally:
             conn.close()
 
@@ -254,8 +279,9 @@ def status():
         c.settimeout(2)
         c.connect(SOCK)
         c.send(b"ping")
+        reply = c.recv(16)
         c.close()
-        print("daemon: ALIVE")
+        print("daemon: ALIVE" if reply == b"pong" else "daemon: NO-REPLY(busy?)")
     except OSError:
         print("daemon: DOWN")
 
