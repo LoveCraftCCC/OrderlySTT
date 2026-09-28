@@ -219,19 +219,22 @@ def polish(text, cfg):
 
 
 def set_clipboard(text):
+    """Wayland 剪贴板必须由带事件循环的客户端持有: 用独立短命进程 set+store+主循环 300ms,
+    完成 compositor 握手后由 GNOME Shell 接管 (守护进程内直接操作会被静默丢弃)."""
+    helper = (
+        "import sys, gi; gi.require_version('Gtk','3.0'); "
+        "from gi.repository import Gtk, Gdk, GLib; "
+        "cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD); "
+        "cb.set_text(sys.argv[1], -1); cb.store(); "
+        "GLib.timeout_add(300, Gtk.main_quit); Gtk.main()"
+    )
     try:
-        import gi
-        gi.require_version("Gtk", "3.0")
-        gi.require_version("Gdk", "3.0")
-        from gi.repository import Gdk, Gtk
-        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        cb.set_text(text, -1)
-        cb.store()
+        subprocess.run([sys.executable, "-c", helper, text], timeout=4)
         return
     except Exception:
         pass
     try:
-        subprocess.run(["wl-copy", text], timeout=3)
+        subprocess.run(["wl-copy", text], timeout=3, input=text.encode("utf-8"))
     except Exception:
         pass
 
