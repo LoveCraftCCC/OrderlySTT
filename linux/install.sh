@@ -42,7 +42,7 @@ P = "org.gnome.settings-daemon.plugins.media-keys"
 KK = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/vernest/"  # 末尾斜杠必须有
 cur = subprocess.run(["gsettings", "get", P, "custom-keybindings"],
                      capture_output=True, text=True).stdout.strip()
-if KK not in cur:
+if KK not in cur and KK.rstrip("/") not in cur:  # 兼容历史无斜杠残废条目, 防重复
     new = "['%s']" % KK if cur in ("@as []", "[]") else cur.replace("[", "['%s', " % KK, 1)
     subprocess.run(["gsettings", "set", P, "custom-keybindings", new], check=True)
 K = P + ".custom-keybinding:" + KK

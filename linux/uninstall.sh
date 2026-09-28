@@ -11,8 +11,10 @@ P = "org.gnome.settings-daemon.plugins.media-keys"
 KK = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/vernest/"
 cur = subprocess.run(["gsettings", "get", P, "custom-keybindings"],
                      capture_output=True, text=True).stdout.strip()
-if KK in cur:
-    new = cur.replace("'%s', " % KK, "").replace(", '%s'" % KK, "").replace("'%s'" % KK, "")
+new = cur
+for variant in (KK, KK.rstrip("/")):
+    new = new.replace("'%s', " % variant, "").replace(", '%s'" % variant, "").replace("'%s'" % variant, "")
+if new != cur:
     if new == "": new = "@as []"
     subprocess.run(["gsettings", "set", P, "custom-keybindings", new], check=True)
     print("  快捷键已移除")
