@@ -1,0 +1,7 @@
+# OrderlySTT Linux runtime — pinned 2026-11-22.
+# Python 3.14 (cp314 manylinux wheels); verified against the bundled
+# SenseVoice int8 2024-07-17 model on zh/en/ja/ko/yue sample wavs.
+# Install into a dedicated venv via linux/install.sh; never into system Python.
+sherpa-onnx==2.0.2
+numpy==2.5.5
+soundfile==0.14.0

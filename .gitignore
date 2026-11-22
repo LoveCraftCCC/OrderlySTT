@@ -55,3 +55,6 @@ e2e_*.wav
 
 # ── PyInstaller 临时 ──────────────────────────────────
 _MEI/
+
+# ── Linux 侧编译产物 (未跟踪的 sidecar 二进制) ──────────
+ui-tauri/src-tauri/bin/*-unknown-linux-gnu
